@@ -1,0 +1,65 @@
+name: Feature request
+description: Propose a change to the supported Brains product contract.
+title: "[feat] "
+labels: ["enhancement", "needs-discussion"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Start with the [Product Brief](https://github.com/kayiik/brains-ai/blob/main/docs/product/PRODUCT_BRIEF.md). It lists what
+        is available now, what is deliberately not in scope and why, and what is intended
+        but unbuilt. Requests that reopen an out-of-scope decision should say what changed.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: Describe the user outcome or limitation without including private data.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the desired supported CLI, MCP, browser, API, or operational contract.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: product_status
+    attributes:
+      label: Product status
+      description: How does this relate to the current product boundary?
+      options:
+        - Change to an advertised core capability
+        - New capability not present in the current contract
+        - Request to reconsider a frozen or withdrawn capability
+        - Documentation or developer-experience change
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Explain current workarounds and why a separate tool is or is not sufficient.
+
+  - type: textarea
+    id: surface
+    attributes:
+      label: Affected surface
+      description: Which CLI commands, MCP tools, routes, or console screens this touches.
+      placeholder: "brains-ai task-claim, brains_claim_task, /app/workspaces/:slug"
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I read the Product Brief and explained what changed if I am asking to reconsider a scope decision.
+          required: true
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: I removed secrets, personal data, private paths, and private infrastructure details.
+          required: true

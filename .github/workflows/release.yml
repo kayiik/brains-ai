@@ -1,0 +1,235 @@
+name: release
+
+# Triggered by a SemVer tag push (e.g. `v0.1.0a3`, `v0.2.0`, `v1.0.0`).
+#
+# Exact-Artifact Promotion:
+#   1. qualify    — refuse to publish unless ci's aggregate `quality gate` check
+#                   succeeded for this exact tagged commit; download and verify
+#                   the exact pre-built wheel, sdist, and provenance manifest from CI
+#                   without rebuilding.
+#   2. pypi       — publish the exact qualified wheel + sdist to PyPI via Trusted
+#                   Publishers (OIDC, no tokens). Zero rebuild.
+#   3. docker     — promote the pre-built multi-arch candidate image on GHCR via
+#                   imagetools create. Zero rebuild.
+#   4. release    — create a GitHub Release with the exact dist/ artifacts attached.
+#
+# One-time setup (must be done by a repo admin before the first tag push):
+#
+#   PyPI  (REQUIRED AGAIN IF THE REPOSITORY MOVES: a Trusted Publisher is
+#          bound to one owner/repository pair, so a tag pushed from anywhere
+#          else is rejected until a matching publisher is registered.)
+#     1. Reserve the project name on https://pypi.org (one manual upload
+#        of any version with `uv publish --token …`, OR claim via Trusted
+#        Publisher form on a fresh project).
+#     2. https://pypi.org/manage/project/brains-ai/settings/publishing/
+#        add a Trusted Publisher:
+#          Owner:           kayiik
+#          Repository:      brains-ai
+#          Workflow name:   release.yml
+#          Environment:     pypi   (must match `environment:` below)
+#
+#   GHCR:
+#     Nothing — uses GITHUB_TOKEN with packages:write.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    name: verify tagged commit passed ci and retrieve exact qualified artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      # Publication is gated on evidence, not on intent. A tag only ships if the
+      # aggregate `quality gate` check completed successfully for this exact
+      # commit. A passing earlier commit, a cancelled run, or no run at all all
+      # fail closed. Remedy: re-run ci on the tagged commit until it is green.
+      - name: Require a green quality gate for this exact commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "tagged commit: ${sha}"
+          conclusion="$(
+            gh api \
+              "repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?check_name=quality+gate" \
+              --jq '[.check_runs[] | select(.status == "completed")]
+                    | sort_by(.completed_at)
+                    | last
+                    | .conclusion // empty'
+          )"
+          if [ "${conclusion}" != "success" ]; then
+            echo "::error::quality gate is '${conclusion:-missing}' for ${sha}; refusing to publish"
+            exit 1
+          fi
+          echo "ok: quality gate succeeded for ${sha}"
+
+      - name: Verify tag matches package version
+        run: python scripts/check_release_version.py "$GITHUB_REF_NAME"
+
+      - name: Download exact qualified dist artifacts from CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "Finding qualifying CI run for commit ${sha}..."
+          run_id="$(
+            gh run list \
+              --commit "${sha}" \
+              --workflow ci.yml \
+              --json databaseId,conclusion \
+              --jq '[.[] | select(.conclusion == "success")] | .[0].databaseId // empty'
+          )"
+          if [ -z "${run_id}" ]; then
+            echo "::error::could not find successful CI run for ${sha}"
+            exit 1
+          fi
+          echo "Found qualifying CI run: ${run_id}"
+          mkdir -p dist
+          gh run download "${run_id}" --name dist --dir dist
+          ls -la dist
+
+      - name: Verify exact artifact provenance without rebuilding
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          python scripts/artifact_promotion.py verify \
+            --dist dist \
+            --candidate "${sha}" \
+            --manifest dist/artifact-provenance.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 14
+
+  pypi:
+    name: publish to PyPI (trusted publisher)
+    needs: qualify
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/brains-ai
+    permissions:
+      id-token: write   # mandatory for OIDC -> PyPI
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Stage distribution packages for PyPI
+        run: |
+          mkdir -p dist-pypi
+          cp dist/*.whl dist/*.tar.gz dist-pypi/
+          ls -la dist-pypi/
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-pypi/
+          print-hash: true
+          # Tolerate re-runs against an already-published version (PyPI is
+          # immutable; a slot can be burned by an aborted release that still
+          # managed to upload before being cancelled). Without this, every
+          # subsequent tag attempt would 400 here and block the GH release.
+          skip-existing: true
+
+  docker:
+    name: promote GHCR image
+    needs: qualify
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/brains-ai
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, 'a') && !contains(github.ref_name, 'b') && !contains(github.ref_name, 'rc') }}
+
+      - name: Promote exact candidate image to release tags
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          candidate_image="ghcr.io/${{ github.repository_owner }}/brains-ai:candidate-${{ github.sha }}"
+          tag_args=()
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            tag_args+=( "--tag" "$tag" )
+          done <<< "$TAGS"
+          echo "Promoting ${candidate_image} to: ${tag_args[*]}"
+          docker buildx imagetools create "${tag_args[@]}" "$candidate_image"
+
+  release:
+    name: create GitHub Release
+    needs: [pypi, docker]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${GITHUB_REF_NAME}"
+          PRE=""
+          case "$TAG" in
+            *a*|*b*|*rc*) PRE="--prerelease" ;;
+          esac
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            $PRE \
+            dist/*
+
+  site:
+    name: sync published release site
+    needs: release
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    # Releases created with GITHUB_TOKEN do not dispatch release-event workflows.
+    uses: ./.github/workflows/sync-release-site.yml

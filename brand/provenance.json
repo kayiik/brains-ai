@@ -1,0 +1,63 @@
+{
+  "format": "brains.brand-provenance/v1",
+  "identity": {
+    "product_name": "Brains",
+    "compact_wordmark": "brains.ai",
+    "distribution": "brains-ai",
+    "mark": "biological multipolar neuron"
+  },
+  "sources": [
+    {
+      "path": "../docs/product/PRODUCT_BRIEF.md",
+      "role": "Product truth, audience, supported boundaries, and canonical identifiers"
+    },
+    {
+      "path": "../AGENTS.md",
+      "role": "Public repository and product-contract constraints"
+    },
+    {
+      "type": "owner-approved identity specification",
+      "role": "Neuron geometry, Matrix Emerald and Void Navy palette, white nucleus, and compact wordmark"
+    }
+  ],
+  "ownership": {
+    "artwork": "Original project artwork maintained by the Brains contributors",
+    "license_notice": "LICENSES.md",
+    "repository_license": "../LICENSE"
+  },
+  "assets": {
+    "editable_logos": [
+      "logos/mark.svg",
+      "logos/mark-inverse.svg",
+      "logos/lockup.svg",
+      "logos/lockup-inverse.svg",
+      "logos/wordmark.svg",
+      "logos/wordmark-inverse.svg",
+      "logos/mono-black.svg",
+      "logos/mono-white.svg"
+    ],
+    "icons": [
+      "icons/favicon.svg",
+      "icons/app-icon.svg",
+      "icons/icon-192.svg",
+      "icons/icon-512.svg"
+    ],
+    "social": [
+      "og/og-default.svg",
+      "og/og-default.png"
+    ],
+    "site_projections": {
+      "logos/mark.svg": "../site/assets/logo-mark.svg",
+      "icons/favicon.svg": "../site/assets/favicon.svg",
+      "og/og-default.svg": "../site/assets/og-default.svg",
+      "og/og-default.png": "../site/assets/og-default.png"
+    }
+  },
+  "maintenance": {
+    "geometry_authority": "BRAND.md",
+    "instructions": "README.md",
+    "raster_source": "og/og-default.svg",
+    "raster_command": "node scripts/render_brand_og.mjs",
+    "method": "Human-reviewed editable SVG and token files with a Playwright-rendered social PNG"
+  }
+}

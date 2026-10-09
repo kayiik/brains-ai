@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Brains brand kit preview</title>
+  <link rel="stylesheet" href="tokens.css">
+  <style>
+    * { box-sizing: border-box; }
+    html { color-scheme: light; background: var(--brains-color-mist); }
+    body { margin: 0; color: var(--brains-color-void-navy); font: 16px/1.6 var(--brains-font-body); }
+    img { display: block; max-width: 100%; }
+    code { font-family: var(--brains-font-mono); font-size: .85em; }
+    .wrap { width: min(1120px, calc(100% - 40px)); margin-inline: auto; }
+    .hero { overflow: hidden; color: white; background: var(--brains-color-void-navy); }
+    .hero-inner { display: grid; grid-template-columns: minmax(240px, 360px) 1fr; align-items: center; gap: 72px; min-height: 540px; padding-block: 72px; }
+    .hero-mark { width: min(100%, 330px); }
+    .kicker { margin: 0 0 18px; color: var(--brains-color-matrix-emerald); font: 700 13px/1.4 var(--brains-font-mono); letter-spacing: .08em; text-transform: uppercase; }
+    h1, h2, h3 { font-family: var(--brains-font-display); letter-spacing: -.035em; line-height: 1.08; }
+    h1 { max-width: 9ch; margin: 0 0 24px; font-size: clamp(54px, 8vw, 92px); }
+    h2 { margin: 0 0 14px; font-size: clamp(32px, 4vw, 48px); }
+    h3 { margin: 0 0 8px; font-size: 19px; }
+    p { margin: 0; }
+    .hero-copy { max-width: 590px; color: #cbd5e1; font-size: 21px; }
+    .hero-facts { display: flex; flex-wrap: wrap; gap: 10px 22px; margin-top: 34px; color: #94a3b8; font: 14px var(--brains-font-mono); }
+    section { padding-block: 72px; }
+    .intro { max-width: 700px; margin-bottom: 36px; color: var(--brains-color-slate); }
+    .asset-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border: 1px solid var(--brains-color-line); background: white; }
+    .asset { min-height: 250px; padding: 34px; border-right: 1px solid var(--brains-color-line); border-bottom: 1px solid var(--brains-color-line); }
+    .asset:nth-child(2n) { border-right: 0; }
+    .asset.dark { color: white; background: var(--brains-color-void-navy); border-color: #1e293b; }
+    .asset-stage { display: grid; place-items: center; min-height: 140px; }
+    .asset-stage img { max-height: 110px; }
+    .asset-stage .mark { width: 112px; }
+    .asset-name { margin-top: 18px; color: var(--brains-color-slate); font: 13px var(--brains-font-mono); }
+    .dark .asset-name { color: #94a3b8; }
+    .palette { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; overflow: hidden; border: 1px solid var(--brains-color-line); background: var(--brains-color-line); }
+    .swatch { min-height: 200px; padding: 24px; background: white; }
+    .swatch-color { height: 100px; margin: -24px -24px 22px; }
+    .swatch strong, .swatch code { display: block; }
+    .type-sample { display: grid; grid-template-columns: 1fr 1fr; gap: 48px; padding: 44px; border: 1px solid var(--brains-color-line); background: white; }
+    .display-sample { font: 700 clamp(42px, 6vw, 72px)/.98 var(--brains-font-display); letter-spacing: -.04em; }
+    .body-sample { max-width: 54ch; color: var(--brains-color-slate); }
+    .icon-row { display: flex; flex-wrap: wrap; align-items: end; gap: 32px; padding: 40px; border: 1px solid #1e293b; background: var(--brains-color-void-navy); }
+    .icon-row figure { margin: 0; color: #94a3b8; font: 12px var(--brains-font-mono); text-align: center; }
+    .icon-row img { margin: 0 auto 12px; }
+    .og { border: 1px solid var(--brains-color-line); background: white; padding: 12px; }
+    footer { padding-block: 34px; border-top: 1px solid var(--brains-color-line); color: var(--brains-color-slate); font-size: 14px; }
+    @media (max-width: 760px) {
+      .hero-inner { grid-template-columns: 1fr; gap: 30px; min-height: auto; }
+      .hero-mark { width: 190px; }
+      .asset-grid, .type-sample { grid-template-columns: 1fr; }
+      .asset { border-right: 0; }
+      .palette { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+  </style>
+</head>
+<body>
+  <header class="hero">
+    <div class="wrap hero-inner">
+      <img class="hero-mark" src="logos/mark-inverse.svg" alt="">
+      <div>
+        <p class="kicker">Brains identity system</p>
+        <h1>Shared context for your agents.</h1>
+        <p class="hero-copy">Local-first coordination for AI coding agents. Decisions stay with you.</p>
+        <div class="hero-facts"><span>Product: Brains</span><span>Visual: brains.ai</span><span>Distribution: brains-ai</span></div>
+      </div>
+    </div>
+  </header>
+  <main>
+    <section class="wrap">
+      <h2>Primary signatures</h2>
+      <p class="intro">The multipolar neuron is the identifying shape. Use the tiled primary assets on light surfaces and transparent inverse assets only on verified dark fields.</p>
+      <div class="asset-grid">
+        <div class="asset"><div class="asset-stage"><img class="mark" src="logos/mark.svg" alt="Brains multipolar neuron mark"></div><p class="asset-name">logos/mark.svg</p></div>
+        <div class="asset dark"><div class="asset-stage"><img class="mark" src="logos/mark-inverse.svg" alt="Brains multipolar neuron mark"></div><p class="asset-name">logos/mark-inverse.svg</p></div>
+        <div class="asset"><div class="asset-stage"><img src="logos/lockup.svg" alt="brains.ai"></div><p class="asset-name">logos/lockup.svg</p></div>
+        <div class="asset dark"><div class="asset-stage"><img src="logos/lockup-inverse.svg" alt="brains.ai"></div><p class="asset-name">logos/lockup-inverse.svg</p></div>
+        <div class="asset"><div class="asset-stage"><img src="logos/wordmark.svg" alt="brains.ai"></div><p class="asset-name">logos/wordmark.svg</p></div>
+        <div class="asset dark"><div class="asset-stage"><img src="logos/wordmark-inverse.svg" alt="brains.ai"></div><p class="asset-name">logos/wordmark-inverse.svg</p></div>
+        <div class="asset"><div class="asset-stage"><img class="mark" src="logos/mono-black.svg" alt="Brains monochrome mark"></div><p class="asset-name">logos/mono-black.svg</p></div>
+        <div class="asset dark"><div class="asset-stage"><img class="mark" src="logos/mono-white.svg" alt="Brains monochrome mark"></div><p class="asset-name">logos/mono-white.svg</p></div>
+      </div>
+    </section>
+    <section class="wrap">
+      <h2>Core color</h2>
+      <p class="intro">Matrix Emerald carries the neuron and signal motif. Void Navy gives it a stable field; Emerald Ink is the accessible green for text on white.</p>
+      <div class="palette">
+        <div class="swatch"><div class="swatch-color" style="background:#10b981"></div><strong>Matrix Emerald</strong><code>#10B981</code></div>
+        <div class="swatch"><div class="swatch-color" style="background:#0b0f19"></div><strong>Void Navy</strong><code>#0B0F19</code></div>
+        <div class="swatch"><div class="swatch-color" style="background:#ffffff;border-bottom:1px solid #cbd5e1"></div><strong>Nucleus White</strong><code>#FFFFFF</code></div>
+        <div class="swatch"><div class="swatch-color" style="background:#047857"></div><strong>Emerald Ink</strong><code>#047857</code></div>
+      </div>
+    </section>
+    <section class="wrap">
+      <h2>Typography</h2>
+      <p class="intro">Use the dependency-free system sans stack in this repository. Space Grotesk is optional only where a consumer already supplies and licenses it.</p>
+      <div class="type-sample">
+        <p class="display-sample">Direct the work.<br>Keep authority.</p>
+        <p class="body-sample">Brains gives connected agent Sessions shared Workspaces, durable work, local mailboxes, reusable knowledge, and explicit decisions. State remains in SQLite on the operator's machine.</p>
+      </div>
+    </section>
+    <section class="wrap">
+      <h2>Icon scale</h2>
+      <p class="intro">Use the supplied dark tile at small sizes. Never crop the terminal nodes or remove the white nucleus.</p>
+      <div class="icon-row">
+        <figure><img src="icons/favicon.svg" width="16" height="16" alt=""><figcaption>16 px</figcaption></figure>
+        <figure><img src="icons/favicon.svg" width="32" height="32" alt=""><figcaption>32 px</figcaption></figure>
+        <figure><img src="icons/icon-192.svg" width="96" height="96" alt=""><figcaption>96 px preview</figcaption></figure>
+        <figure><img src="icons/icon-512.svg" width="160" height="160" alt=""><figcaption>160 px preview</figcaption></figure>
+      </div>
+    </section>
+    <section class="wrap">
+      <h2>Social preview</h2>
+      <p class="intro">The default 1200 by 630 artwork uses only a factual product descriptor and the approved visual signature.</p>
+      <div class="og"><img src="og/og-default.svg" alt="Brains, local-first coordination for AI coding agents"></div>
+    </section>
+  </main>
+  <footer><div class="wrap">See <code>BRAND.md</code> for naming, usage, accessibility, and product-claim boundaries.</div></footer>
+</body>
+</html>

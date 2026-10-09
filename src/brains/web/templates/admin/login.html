@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Brains · Sign in</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { min-height: 100vh; margin: 0; display: grid; place-items: center; background: #101114; color: #f3f4f6; }
+    main { width: min(28rem, calc(100% - 2rem)); }
+    form { display: grid; gap: 1rem; padding: 1.5rem; border: 1px solid #353841; border-radius: .75rem; background: #191b20; }
+    label { font-weight: 650; }
+    input, button { box-sizing: border-box; width: 100%; min-height: 2.75rem; border-radius: .4rem; font: inherit; }
+    input { border: 1px solid #525866; padding: .65rem; background: #101114; color: inherit; }
+    button { border: 0; padding: .65rem 1rem; background: #cdd3ff; color: #101114; font-weight: 700; cursor: pointer; }
+    .error { color: #ffb4ab; }
+  </style>
+</head>
+<body>
+  <main>
+    <form method="post" action="/admin/login">
+      <h1>Sign in to Brains</h1>
+      {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+      {% if next_url %}<input type="hidden" name="next" value="{{ next_url }}" />{% endif %}
+      <label for="key">Admin key</label>
+      <input type="password" id="key" name="key" autocomplete="off" autofocus required />
+      <button type="submit">Sign in</button>
+    </form>
+  </main>
+</body>
+</html>

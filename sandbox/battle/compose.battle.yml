@@ -1,0 +1,87 @@
+# Retained unsupported battle fixture.
+#
+# This topology depends on withdrawn Postgres, model-routing, multi-user, and legacy
+# browser behavior. It is not a supported installation or validation path and
+# intentionally provides no activation recipe. Any archaeological evaluation must be
+# disposable and use external, uncommitted synthetic configuration.
+name: brains-battle
+
+x-brain-env: &brain-env
+  HOME: /home/agent
+  BRAINS_STATE_DIR: /home/agent/.brains
+  BRAINS_DB_URL: postgresql+psycopg://brains:brains@pg:5432/brains
+  BRAINS_RUNTIME_OVERLAY: /home/agent/.brains/brains.runtime.yaml
+  BRAINS_MCP_BIND: 0.0.0.0
+  BRAINS_MCP_ALLOW_PUBLIC: "1"
+  # Retained model-routing values are compatibility fixture data only; they do not
+  # describe a supported configuration or activation path.
+  BRAINS_OPENAI_COMPATIBLE_BASE_URL: ${LITELLM_BASE_URL:-https://api.openai.com/v1}
+  BRAINS_OPENAI_COMPATIBLE_API_KEY: ${LITELLM_KEY:-}
+
+x-brain-cmd: &brain-cmd
+  - bash
+  - -lc
+  - >
+    mkdir -p /home/agent/.brains &&
+    printf 'schema_version: 1\nsubsystems:\n  storage:\n    backend: postgres\nsavings:\n  enabled: true\n  baseline_model: gpt-4o\nmodels:\n  cheap: {provider: openai_compatible, model: chat-fast}\n  default: {provider: openai_compatible, model: code}\n  strong: {provider: openai_compatible, model: chat-smart}\n  deep: {provider: openai_compatible, model: reason}\n' > /home/agent/.brains/brains.runtime.yaml &&
+    exec brains-ai up --gateway-host 0.0.0.0 --dashboard-host 0.0.0.0
+
+services:
+  pg:
+    image: postgres:16-alpine
+    container_name: battle-pg
+    environment:
+      POSTGRES_USER: brains
+      POSTGRES_PASSWORD: brains
+      POSTGRES_DB: brains
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U brains -d brains"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  brain-a:
+    image: brains-battle:dev
+    container_name: battle-brain-a
+    depends_on:
+      pg:
+        condition: service_healthy
+    volumes:
+      - ../..:/opt/brains:ro
+    environment:
+      <<: *brain-env
+      BRAINS_OPERATOR: alice
+    command: *brain-cmd
+    ports:
+      - "127.0.0.1:28787:8787"
+      - "127.0.0.1:28876:9876"
+      - "127.0.0.1:28877:9877"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 18
+      start_period: 30s
+
+  brain-b:
+    image: brains-battle:dev
+    container_name: battle-brain-b
+    depends_on:
+      pg:
+        condition: service_healthy
+    volumes:
+      - ../..:/opt/brains:ro
+    environment:
+      <<: *brain-env
+      BRAINS_OPERATOR: bob
+    command: *brain-cmd
+    ports:
+      - "127.0.0.1:29787:8787"
+      - "127.0.0.1:29876:9876"
+      - "127.0.0.1:29877:9877"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 18
+      start_period: 30s

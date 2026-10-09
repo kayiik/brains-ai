@@ -1,0 +1,90 @@
+name: Bug report
+description: Report supported Brains behavior that is broken or differs from its contract.
+title: "[bug] "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a Brains defect. For security vulnerabilities, do not use
+        this form; use [GitHub Security Advisories](https://github.com/kayiik/brains-ai/security/advisories/new).
+
+        Before submitting, remove credentials, personal data, private paths, hostnames,
+        repository contents, and other identifying diagnostics.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or candidate
+      description: Provide the Brains version or commit SHA. Include an artifact digest only when relevant.
+      placeholder: "brains-ai 1.x.y or commit SHA"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install_method
+    attributes:
+      label: Install method
+      options:
+        - pipx
+        - pip or virtual environment
+        - editable source checkout
+        - isolated container
+        - other
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Operating system and Python version, without machine names or private paths.
+      placeholder: "Windows / Python 3.12"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Use supported commands or endpoints and replace all sensitive values with placeholders.
+      placeholder: |
+        1. Run `<supported command>` with synthetic data.
+        2. Observe `<redacted result>`.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Link a related issue, documented contract, or existing test reference when known.
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Summarize the failure. Include only the smallest sanitized error excerpt needed.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Do not paste environment dumps, complete logs, credentials, personal data, or private filesystem paths.
+      render: shell
+
+  - type: checkboxes
+    id: terms
+    attributes:
+      label: Pre-flight
+      options:
+        - label: I searched existing issues and discussions.
+          required: true
+        - label: I removed secrets, personal data, private paths, hostnames, and repository contents.
+          required: true
+        - label: This report concerns an advertised core surface or a containment failure reachable from it.
+          required: true

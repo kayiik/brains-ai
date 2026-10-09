@@ -1,0 +1,1016 @@
+"""Shared types + helpers for the OS-service installers.
+
+``brains.service`` installs the supervised ``serve-all`` stack as a
+user-level OS service that starts at login and restarts on failure:
+
+* **Windows** — a Task Scheduler task (``brains.service.windows``).
+* **macOS**   — a launchd LaunchAgent (``brains.service.macos``).
+* **Linux**   — a systemd ``--user`` unit (``brains.service.linux``).
+
+Two hard rules, learned the hard way, are encoded here:
+
+1. **Run as the logged-in user, never root / LocalSystem.** brains resolves
+   its state dir, the canonical per-machine DB, and the ``github_copilot``
+   OAuth cache from the user's ``HOME``. A system-account service would point
+   ``HOME`` elsewhere — breaking auth and silently re-fragmenting the DB into
+   a second per-profile ``brains.db``.
+2. **Exec via the installed environment, not ``PATH``.** POSIX services use
+   the exact interpreter running ``install``. Windows selects that
+   environment's sibling ``pythonw.exe`` and verifies it imports Brains before
+   registration, avoiding a persistent console without guessing another
+   environment.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import csv
+import getpass
+import json
+import math
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any, cast
+
+from brains.mcp.transport import mcp_http_url
+
+# Logical identifiers, mapped to per-OS names by each backend.
+SERVICE_LABEL = "brains-serve-all"
+WINDOWS_TASK_NAME = "BrainsServeAll"
+LAUNCHD_LABEL = "com.brains.serve-all"
+SYSTEMD_UNIT = "brains-serve-all.service"
+_SERVICE_LABEL_RE = re.compile(r"^brains-serve-all(?:-[a-z0-9][a-z0-9-]{0,39})?$")
+
+DEFAULT_GATEWAY_HOST = "127.0.0.1"
+DEFAULT_GATEWAY_PORT = 8787
+DEFAULT_MCP_PORT = 9877
+GATEWAY_FALLBACK_PORTS = range(8877, 8978)
+
+
+def _service_description(gateway_host: str, gateway_port: int, mcp_port: int) -> str:
+    return (
+        f"Brains control plane — supervises the gateway ({gateway_host}:{gateway_port}), "
+        f"and the Streamable HTTP MCP server ({gateway_host}:{mcp_port}/mcp). "
+        "Starts at login and restarts on failure."
+    )
+
+
+SERVICE_DESCRIPTION = _service_description(
+    DEFAULT_GATEWAY_HOST, DEFAULT_GATEWAY_PORT, DEFAULT_MCP_PORT
+)
+
+
+def current_platform() -> str:
+    """Return ``'windows'``, ``'macos'``, ``'linux'``, or the raw platform."""
+    if sys.platform.startswith("win"):
+        return "windows"
+    if sys.platform == "darwin":
+        return "macos"
+    if sys.platform.startswith("linux"):
+        return "linux"
+    return sys.platform
+
+
+def state_dir() -> Path:
+    """The brains state dir (``BRAINS_STATE_DIR`` or ``~/.brains``)."""
+    override = os.environ.get("BRAINS_STATE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    return (Path.home() / ".brains").resolve()
+
+
+def _service_python(executable: str | None = None) -> str:
+    """The interpreter the service should launch.
+
+    Defaults to the exact interpreter running this process. Windows services
+    use the same environment's ``pythonw.exe`` so Task Scheduler does not
+    create a persistent console window; installation separately verifies that
+    this launcher imports Brains before registering the task.
+    """
+    selected = Path(executable or sys.executable)
+    if current_platform() != "windows" or selected.name.casefold() == "pythonw.exe":
+        return str(selected)
+    windowless = selected.with_name("pythonw.exe")
+    if not windowless.is_file():
+        raise ValueError(
+            f"windowless Python launcher is unavailable beside the service interpreter: {windowless}"
+        )
+    return str(windowless)
+
+
+def verify_service_interpreter(program: str) -> dict[str, Any]:
+    """Prove the service interpreter imports this installed Brains package."""
+    rc, out, err = run_cmd(
+        [
+            program,
+            "-c",
+            "import brains,sys; print(sys.prefix); print(brains.__file__)",
+        ]
+    )
+    return {
+        "ok": rc == 0,
+        "program": program,
+        "detail": out or err,
+    }
+
+
+def service_config_path() -> Path:
+    """Non-secret endpoint configuration used by service status probes."""
+    return state_dir() / "service" / "endpoints.json"
+
+
+def read_service_config() -> dict[str, Any]:
+    defaults: dict[str, Any] = {
+        "gateway_host": DEFAULT_GATEWAY_HOST,
+        "gateway_port": DEFAULT_GATEWAY_PORT,
+        "mcp_port": DEFAULT_MCP_PORT,
+        "service_label": SERVICE_LABEL,
+    }
+    try:
+        raw = json.loads(service_config_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, TypeError):
+        return defaults
+    if not isinstance(raw, dict):
+        return defaults
+    try:
+        host = str(raw.get("gateway_host") or DEFAULT_GATEWAY_HOST)
+        gateway_port = _valid_port(raw.get("gateway_port"), "gateway_port")
+        mcp_port = _valid_port(raw.get("mcp_port"), "mcp_port")
+    except ValueError:
+        return defaults
+    try:
+        label = validate_service_label(str(raw.get("service_label") or SERVICE_LABEL))
+    except ValueError:
+        label = SERVICE_LABEL
+    return {
+        "gateway_host": host,
+        "gateway_port": gateway_port,
+        "mcp_port": mcp_port,
+        "service_label": label,
+    }
+
+
+def write_service_config(spec: ServiceSpec) -> Path:
+    path = service_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": 1,
+        "gateway_host": spec.gateway_host,
+        "gateway_port": spec.gateway_port,
+        "mcp_port": spec.mcp_port,
+        "service_label": spec.label,
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def listener_status(
+    host: str | None = None,
+    gateway_port: int | None = None,
+    mcp_port: int | None = None,
+) -> dict[str, Any]:
+    """Bounded listener and protocol probes for the supervised service."""
+    configured = read_service_config()
+    resolved_host = host or str(configured["gateway_host"])
+    resolved_gateway_port = gateway_port or int(configured["gateway_port"])
+    resolved_mcp_port = mcp_port or int(configured["mcp_port"])
+    listeners: dict[str, bool] = {}
+    for name, port in (("gateway", resolved_gateway_port), ("mcp", resolved_mcp_port)):
+        try:
+            with socket.create_connection((resolved_host, port), timeout=0.4):
+                listeners[name] = True
+        except OSError:
+            listeners[name] = False
+    mcp_protocol = (
+        mcp_protocol_status(resolved_host, resolved_mcp_port)
+        if listeners["mcp"]
+        else {
+            "ready": False,
+            "stage": "connect",
+            "reason": "listener-unavailable",
+        }
+    )
+    return {
+        "listeners": listeners,
+        "mcp_protocol": mcp_protocol,
+        "serving": bool(listeners["gateway"] and mcp_protocol["ready"]),
+        "endpoints": {
+            "gateway": f"http://{resolved_host}:{resolved_gateway_port}",
+            "console": f"http://{resolved_host}:{resolved_gateway_port}/app",
+            "mcp": mcp_http_url(resolved_host, resolved_mcp_port),
+        },
+    }
+
+
+def _exception_status_code(exc: BaseException) -> int | None:
+    """Find an HTTP status on an exception tree without exposing its body."""
+
+    pending = [exc]
+    while pending:
+        current = pending.pop()
+        response = getattr(current, "response", None)
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            return status
+        direct = getattr(current, "status_code", None)
+        if isinstance(direct, int):
+            return direct
+        nested = getattr(current, "exceptions", ())
+        if isinstance(nested, tuple | list):
+            pending.extend(item for item in nested if isinstance(item, BaseException))
+    return None
+
+
+def _is_connection_failure(exc: BaseException) -> bool:
+    """Recognize transport failures even when an SDK wraps them in a group."""
+    import httpx
+
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (httpx.ConnectError, httpx.ConnectTimeout, ConnectionError)):
+            return True
+        nested = getattr(current, "exceptions", ())
+        if isinstance(nested, tuple | list):
+            pending.extend(item for item in nested if isinstance(item, BaseException))
+        for linked in (current.__cause__, current.__context__):
+            if isinstance(linked, BaseException):
+                pending.append(linked)
+    return False
+
+
+async def _mcp_protocol_handshake(url: str, api_key: str | None, timeout: float) -> dict[str, Any]:
+    """Initialize MCP and list tools, returning only bounded non-secret facts."""
+
+    import httpx
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamable_http_client
+
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    stage = "connect"
+    try:
+        async with (
+            httpx.AsyncClient(headers=headers, timeout=timeout, trust_env=False) as client,
+            streamable_http_client(url, http_client=client) as streams,
+        ):
+            read_stream, write_stream, _ = streams
+            async with ClientSession(read_stream, write_stream) as session:
+                stage = "initialize"
+                await session.initialize()
+                stage = "tools-list"
+                tools = await session.list_tools()
+                names = {tool.name for tool in tools.tools}
+                if "brains_start_session" not in names:
+                    return {
+                        "ready": False,
+                        "stage": stage,
+                        "reason": "core-tool-missing",
+                    }
+                return {
+                    "ready": True,
+                    "stage": "ready",
+                    "reason": "initialize-and-tools-list-succeeded",
+                    "tool_count": len(names),
+                }
+    except Exception as exc:  # noqa: BLE001 - converted to bounded readiness state
+        status_code = _exception_status_code(exc)
+        if status_code in {401, 403}:
+            failed_stage = "authentication"
+            reason = "credential-rejected"
+        elif _is_connection_failure(exc):
+            failed_stage = "connect"
+            reason = "connection-failed"
+        elif status_code is not None:
+            failed_stage = "protocol"
+            reason = "http-protocol-rejected"
+        elif stage == "connect":
+            failed_stage = "connect"
+            reason = "connection-failed"
+        else:
+            failed_stage = stage
+            reason = f"{stage}-failed"
+        report: dict[str, Any] = {
+            "ready": False,
+            "stage": failed_stage,
+            "reason": reason,
+            "error_type": type(exc).__name__,
+        }
+        if status_code is not None:
+            report["status_code"] = status_code
+        return report
+
+
+def mcp_protocol_status(
+    host: str = DEFAULT_GATEWAY_HOST,
+    port: int = DEFAULT_MCP_PORT,
+    *,
+    timeout: float = 3.0,
+) -> dict[str, Any]:
+    """Perform an authenticated Streamable HTTP initialize + tools/list probe.
+
+    The report never includes the credential, exception text, or response body.
+    Missing credentials fail before any request unless the operator explicitly
+    configured unauthenticated API access.
+    """
+
+    from brains.api.admin_key import read_persisted_key
+    from brains.config import settings
+
+    api_key = settings.api_key or read_persisted_key()
+    if not api_key and not settings.allow_unauthenticated_api:
+        return {
+            "ready": False,
+            "stage": "authentication",
+            "reason": "credential-unavailable",
+        }
+    return asyncio.run(_mcp_protocol_handshake(mcp_http_url(host, port), api_key, timeout))
+
+
+def _valid_port(value: object, name: str) -> int:
+    try:
+        port = int(cast(Any, value))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer TCP port") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{name} must be between 1 and 65535")
+    return port
+
+
+def probe_listener_port(host: str, port: int) -> dict[str, Any]:
+    """Try the bind the child will need without starting a service process."""
+    resolved_port = _valid_port(port, "port")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        sock.bind((host, resolved_port))
+    except OSError as exc:
+        return {
+            "available": False,
+            "host": host,
+            "port": resolved_port,
+            "error_code": getattr(exc, "winerror", None) or exc.errno,
+            "reason": "the address cannot be bound",
+        }
+    finally:
+        sock.close()
+    return {"available": True, "host": host, "port": resolved_port}
+
+
+def select_gateway_port(
+    host: str,
+    requested: int | None = None,
+    *,
+    allow_fallback: bool | None = None,
+) -> tuple[int, bool]:
+    """Resolve a service gateway port, falling back only for the default."""
+    explicit = requested is not None
+    fallback_allowed = not explicit if allow_fallback is None else allow_fallback
+    candidate = _valid_port(requested if explicit else DEFAULT_GATEWAY_PORT, "gateway_port")
+    if probe_listener_port(host, candidate)["available"]:
+        return candidate, False
+    if not fallback_allowed:
+        raise ValueError(f"gateway port {candidate} is unavailable on {host}")
+    for fallback in GATEWAY_FALLBACK_PORTS:
+        if probe_listener_port(host, fallback)["available"]:
+            return fallback, True
+    raise ValueError("no available gateway port in the default fallback range")
+
+
+def current_user() -> str:
+    """Best-effort ``DOMAIN\\user`` (Windows) or bare username (POSIX)."""
+    name = getpass.getuser()
+    if current_platform() == "windows":
+        domain = os.environ.get("USERDOMAIN")
+        if domain and "\\" not in name:
+            return f"{domain}\\{name}"
+    return name
+
+
+def validate_service_label(label: str) -> str:
+    """Validate a logical Brains-owned service label.
+
+    Custom identities are deliberately confined to the Brains namespace so a
+    caller cannot make install/uninstall target an arbitrary native service.
+    """
+    if not _SERVICE_LABEL_RE.fullmatch(label):
+        raise ValueError(
+            "service label must be 'brains-serve-all' or "
+            "'brains-serve-all-<lowercase letters, digits, hyphens>'"
+        )
+    return label
+
+
+def native_service_identity(platform: str, label: str = SERVICE_LABEL) -> str:
+    """Map a validated logical label to the platform-native identity."""
+    resolved = validate_service_label(label)
+    suffix = resolved.removeprefix(SERVICE_LABEL).removeprefix("-")
+    if platform == "windows":
+        return WINDOWS_TASK_NAME if not suffix else f"{WINDOWS_TASK_NAME}-{suffix}"
+    if platform == "macos":
+        return LAUNCHD_LABEL if not suffix else f"{LAUNCHD_LABEL}.{suffix}"
+    if platform == "linux":
+        return SYSTEMD_UNIT if not suffix else f"{SERVICE_LABEL}-{suffix}.service"
+    raise ValueError(f"unsupported service platform {platform!r}")
+
+
+@dataclass
+class ServiceSpec:
+    """Everything a backend needs to render + register the service.
+
+    Pure data — backends turn this into a Task Scheduler XML / launchd plist /
+    systemd unit. Construct via :func:`default_spec` for the live values.
+    """
+
+    program: str
+    args: list[str] = field(default_factory=lambda: ["-m", "brains", "serve-all"])
+    working_dir: str = field(default_factory=lambda: str(Path.home()))
+    user: str = field(default_factory=current_user)
+    label: str = SERVICE_LABEL
+    description: str = SERVICE_DESCRIPTION
+    state_dir: str = field(default_factory=lambda: str(state_dir()))
+    gateway_host: str = DEFAULT_GATEWAY_HOST
+    gateway_port: int = DEFAULT_GATEWAY_PORT
+    mcp_port: int = DEFAULT_MCP_PORT
+
+    def __post_init__(self) -> None:
+        self.label = validate_service_label(self.label)
+        self.gateway_port = _valid_port(self.gateway_port, "gateway_port")
+        self.mcp_port = _valid_port(self.mcp_port, "mcp_port")
+        if self.gateway_port == self.mcp_port:
+            # The supervisor rejects this pair deterministically, so installing
+            # it would only persist a service that can never come up.
+            raise ValueError(f"gateway_port and mcp_port must differ (both {self.gateway_port})")
+
+    @property
+    def command_line(self) -> str:
+        """``program + args`` as a display string (quoted where needed)."""
+        parts = [self.program, *self.args]
+        return " ".join(_quote(p) for p in parts)
+
+
+def _quote(token: str) -> str:
+    return f'"{token}"' if (" " in token and not token.startswith('"')) else token
+
+
+def default_spec(
+    executable: str | None = None,
+    *,
+    label: str = SERVICE_LABEL,
+    gateway_host: str = DEFAULT_GATEWAY_HOST,
+    gateway_port: int | None = None,
+    mcp_port: int | None = None,
+    probe_default: bool = True,
+) -> ServiceSpec:
+    """Build a :class:`ServiceSpec` from the live interpreter + environment."""
+    persisted = read_service_config()
+    if gateway_port is None and service_config_path().is_file():
+        resolved_gateway_port = int(persisted["gateway_port"])
+        used_fallback = resolved_gateway_port != DEFAULT_GATEWAY_PORT
+    elif gateway_port is None and not probe_default:
+        resolved_gateway_port = DEFAULT_GATEWAY_PORT
+        used_fallback = False
+    elif gateway_port is None:
+        resolved_gateway_port, used_fallback = select_gateway_port(
+            gateway_host,
+            allow_fallback=True,
+        )
+    else:
+        resolved_gateway_port, used_fallback = select_gateway_port(
+            gateway_host,
+            gateway_port,
+            allow_fallback=False,
+        )
+    resolved_mcp_port = _valid_port(
+        mcp_port if mcp_port is not None else persisted["mcp_port"], "mcp_port"
+    )
+    description = _service_description(gateway_host, resolved_gateway_port, resolved_mcp_port)
+    if used_fallback:
+        description += " The gateway port was selected because the default was unavailable."
+    return ServiceSpec(
+        program=_service_python(executable),
+        args=[
+            "-m",
+            "brains",
+            "serve-all",
+            "--gateway-host",
+            gateway_host,
+            "--gateway-port",
+            str(resolved_gateway_port),
+            "--mcp-port",
+            str(resolved_mcp_port),
+        ],
+        gateway_host=gateway_host,
+        gateway_port=resolved_gateway_port,
+        mcp_port=resolved_mcp_port,
+        description=description,
+        label=label,
+    )
+
+
+def run_cmd(cmd: list[str], *, check: bool = False) -> tuple[int, str, str]:
+    """Run ``cmd`` and return ``(returncode, stdout, stderr)``.
+
+    Never raises on a non-zero exit or a missing platform utility unless
+    ``check`` is set; callers fold the result into a structured report instead.
+    """
+    try:
+        proc = subprocess.run(  # noqa: S603 - args are constructed, never shell
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        if check:
+            raise RuntimeError(f"command could not start: {' '.join(cmd)}: {exc}") from exc
+        return 127, "", str(exc)
+    if check and proc.returncode != 0:
+        raise RuntimeError(
+            f"command failed ({proc.returncode}): {' '.join(cmd)}\n{proc.stderr.strip()}"
+        )
+    return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+
+def default_pidfile_path() -> Path:
+    """The supervisor's own PID file: ``<state>/sessions/service.pid``."""
+    return state_dir() / "sessions" / "service.pid"
+
+
+def read_pidfile(path: Path | None = None) -> int | None:
+    """Return the PID recorded at ``path`` (default: ``service.pid``).
+
+    Legacy int-only accessor, kept for existing callers (the Windows/macOS
+    ``stop()`` tree-kill paths). Prefer :func:`read_pidfile_record` +
+    :func:`verify_pid` for anything that reports or acts on *whether the
+    service is actually running* — a bare PID number proves nothing.
+    """
+    record = read_pidfile_record(path)
+    if record is None:
+        return None
+    pid = record.get("pid")
+    return pid if isinstance(pid, int) else None
+
+
+# --------------------------------------------------------------------------- #
+# PID identity
+#
+# A PID file historically held nothing but a bare integer: no proof the
+# number still names *our* process rather than an unrelated one the OS
+# recycled the PID onto after a crash or reboot. ``write_pidfile`` now
+# additively records the executable path, a command-line fingerprint, and
+# (where the platform exposes it) the process start time, captured for the
+# same PID right after we launched it. ``verify_pid`` compares that record
+# against the live process table so ``status()``/``stop()`` can distinguish
+# "running", "stale" (PID reused by something else), and "unverified"
+# (a legacy plain-integer file, or a platform that can't expose identity) —
+# never confidently reporting a bare number as proof of liveness.
+# --------------------------------------------------------------------------- #
+
+#: Bumped only if the on-disk shape changes in a backwards-incompatible way.
+PIDFILE_FORMAT = 2
+
+#: Confidence levels returned by :func:`verify_pid`.
+CONFIDENCE_ABSENT = "absent"  # no pidfile / no recorded pid
+CONFIDENCE_STALE = "stale"  # recorded pid does not name a live matching process
+CONFIDENCE_UNVERIFIED = "unverified"  # legacy pidfile: alive, but nothing to compare
+CONFIDENCE_DEGRADED = "degraded"  # alive, but identity could not be confirmed here
+CONFIDENCE_VERIFIED = "verified"  # alive AND executable/start-time match
+
+# Allow a couple of seconds of slack when comparing recorded vs. live process
+# start times — WMI/`/proc`/`ps` each round to a different granularity.
+_START_TIME_TOLERANCE_SECONDS = 2.0
+
+
+def _quote_cmdline(argv: list[str]) -> str:
+    return " ".join(_quote(str(a)) for a in argv)
+
+
+def _normalize_exe(value: str | None) -> str | None:
+    """Basename, lower-cased — robust to short image names vs. full paths
+    (``tasklist`` reports ``python.exe``; ``sys.executable`` is the full path)."""
+    if not value:
+        return None
+    cleaned = value.strip().strip('"')
+    if not cleaned:
+        return None
+    return Path(cleaned).name.lower()
+
+
+def _linux_identity(pid: int) -> dict[str, Any] | None:
+    proc_dir = Path(f"/proc/{pid}")
+    if not proc_dir.is_dir():
+        return None
+    exe: str | None = None
+    with contextlib.suppress(OSError):
+        exe = os.readlink(proc_dir / "exe")
+    start_time: float | None = None
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        stat_text = (proc_dir / "stat").read_text(encoding="utf-8")
+        # ``comm`` (field 2) may itself contain spaces/parens; split after its
+        # closing paren so the remaining fields line up. Field 22 (starttime)
+        # is then at offset 19 into the remainder (fields 3..).
+        after = stat_text.rsplit(")", 1)[-1].split()
+        ticks = int(after[19])
+        hz = cast(Any, os).sysconf("SC_CLK_TCK")
+        btime: int | None = None
+        for line in Path("/proc/stat").read_text(encoding="utf-8").splitlines():
+            if line.startswith("btime "):
+                btime = int(line.split()[1])
+                break
+        if btime is not None:
+            start_time = float(btime) + ticks / hz
+    return {"exe": exe, "start_time": start_time}
+
+
+def _macos_identity(pid: int) -> dict[str, Any] | None:
+    # One process-table row, not independently sampled comm/lstart values from
+    # opposite sides of exit/PID reuse. Keep comm last: executable paths have spaces.
+    rc, out, err = run_cmd(["ps", "-ww", "-p", str(pid), "-o", "pid=,lstart=,comm="])
+    if rc == 1 and not out.strip() and not err.strip():
+        return None  # ps found no selected process
+    unknown = {"exe": None, "start_time": None}
+    if rc != 0 or len(out.splitlines()) != 1:
+        return unknown
+    fields = out.split(maxsplit=6)
+    if len(fields) != 7 or fields[0] != str(pid):
+        return unknown
+    start_time: float | None = None
+    with contextlib.suppress(ValueError, OverflowError):
+        start_time = time.mktime(time.strptime(" ".join(fields[1:6]), "%a %b %d %H:%M:%S %Y"))
+    return {"exe": fields[6], "start_time": start_time}
+
+
+def _parse_wmi_datetime(value: str) -> float | None:
+    """Parse a WMI ``CIM_DATETIME`` (``yyyymmddHHMMSS.ffffff+UUU``) to epoch."""
+    body = value.strip()
+    if len(body) < 14:
+        return None
+    try:
+        dt = datetime.strptime(body[:14], "%Y%m%d%H%M%S")
+        return dt.replace(tzinfo=None).timestamp()
+    except ValueError:
+        return None
+
+
+def _windows_identity(pid: int) -> dict[str, Any] | None:
+    rc, out, _ = run_cmd(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"])
+    if rc != 0 or not out or out.strip().lower().startswith("info:"):
+        return None
+    row = next(csv.reader([out.splitlines()[0]]), [])
+    if not row:
+        return None
+    exe: str | None = row[0] or None  # short image name, e.g. "python.exe"
+    start_time: float | None = None
+    command_line: str | None = None
+    # Prefer the supported CIM API through PowerShell. Windows PowerShell and
+    # PowerShell 7 both expose Get-CimInstance on supported hosts.
+    with contextlib.suppress(Exception):
+        script = (
+            f"$p=Get-CimInstance Win32_Process -Filter 'ProcessId = {pid}';"
+            "if($p){$p|Select-Object ExecutablePath,CommandLine,"
+            "@{n='CreationDate';e={$_.CreationDate.ToUniversalTime().ToString('o')}}"
+            "|ConvertTo-Json -Compress}"
+        )
+        rc_cim, out_cim, _ = run_cmd(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+        )
+        if rc_cim == 0 and out_cim.strip():
+            data = json.loads(out_cim)
+            if isinstance(data, dict):
+                path = data.get("ExecutablePath")
+                if isinstance(path, str) and path.strip():
+                    exe = path.strip()
+                command = data.get("CommandLine")
+                if isinstance(command, str) and command.strip():
+                    command_line = command.strip()
+                created = data.get("CreationDate")
+                if isinstance(created, str) and created.strip():
+                    with contextlib.suppress(ValueError):
+                        parsed = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                        start_time = parsed.timestamp()
+    # Best-effort full path + creation time. `wmic` is deprecated on newer
+    # Windows builds; retain it only as a compatibility fallback.
+    if start_time is None:
+        with contextlib.suppress(Exception):
+            rc2, out2, _ = run_cmd(
+                [
+                    "wmic",
+                    "process",
+                    "where",
+                    f"ProcessId={pid}",
+                    "get",
+                    "ExecutablePath,CreationDate",
+                    "/FORMAT:LIST",
+                ]
+            )
+            if rc2 == 0 and out2:
+                for line in out2.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("ExecutablePath="):
+                        value = stripped.split("=", 1)[1].strip()
+                        if value:
+                            exe = value
+                    elif stripped.startswith("CreationDate="):
+                        start_time = _parse_wmi_datetime(stripped.split("=", 1)[1])
+    return {"exe": exe, "start_time": start_time, "cmdline": command_line}
+
+
+def _read_process_identity(pid: int) -> dict[str, Any] | None:
+    """Best-effort live identity for ``pid``: ``{"exe": ..., "start_time": ...}``.
+
+    Returns ``None`` when no process with this PID is currently running.
+    Individual fields may be ``None`` when this platform/permission level
+    can't expose them — callers must treat a ``None`` field as "not
+    comparable", never as a mismatch.
+    """
+    plat = current_platform()
+    try:
+        if plat == "linux":
+            return _linux_identity(pid)
+        if plat == "macos":
+            return _macos_identity(pid)
+        if plat == "windows":
+            return _windows_identity(pid)
+    except Exception:  # pragma: no cover - defensive; never raise from a probe
+        return {"exe": None, "start_time": None} if plat == "macos" else None
+    return None
+
+
+def write_pidfile(
+    path: Path | None = None,
+    *,
+    pid: int | None = None,
+    cmdline: list[str] | None = None,
+) -> dict[str, Any]:
+    """Write the additive PID-identity file (default: ``service.pid``).
+
+    Captures the PID plus, where the platform allows it, the executable and
+    process start time recorded for that same PID right after launch — so a
+    later :func:`verify_pid` has something to compare the live process
+    against instead of trusting the bare number.
+    """
+    resolved_pid = pid if pid is not None else os.getpid()
+    identity = _read_process_identity(resolved_pid) or {}
+    record: dict[str, Any] = {
+        "format": PIDFILE_FORMAT,
+        "pid": resolved_pid,
+        "exe": identity.get("exe") or sys.executable,
+        "cmdline": _quote_cmdline(cmdline if cmdline is not None else sys.argv),
+        "start_time": identity.get("start_time"),
+        "recorded_at": datetime.now(UTC).isoformat(),
+    }
+    target = path or default_pidfile_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(record), encoding="utf-8")
+    return record
+
+
+def read_pidfile_record(path: Path | None = None) -> dict[str, Any] | None:
+    """Read a PID-identity file, tolerating the legacy plain-integer format.
+
+    Returns ``None`` when the file is absent or unreadable. A legacy file
+    (a bare integer, written before structured identity records) is returned as
+    ``{"format": "legacy", "pid": <int>, "exe": None, ...}`` so callers can
+    still recover the PID, while :func:`verify_pid` treats it as
+    unverifiable rather than confidently running.
+    """
+    target = path or default_pidfile_path()
+    try:
+        raw = target.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    if not raw:
+        return None
+    legacy_record: dict[str, Any] | None = None
+    try:
+        pid = int(raw)
+    except ValueError:
+        pid = None
+    if pid is not None:
+        legacy_record = {
+            "format": "legacy",
+            "pid": pid,
+            "exe": None,
+            "cmdline": None,
+            "start_time": None,
+            "recorded_at": None,
+        }
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return legacy_record
+    if not isinstance(data, dict) or not isinstance(data.get("pid"), int):
+        # A bare integer is valid JSON too (``json.loads("4242") == 4242``);
+        # anything that isn't the structured ``{"pid": ...}`` shape falls
+        # back to the legacy bare-integer interpretation.
+        return legacy_record
+    return data
+
+
+def verify_pid(record: dict[str, Any] | int | None) -> dict[str, Any]:
+    """Validate a recorded PID against the live process table.
+
+    ``record`` is whatever :func:`read_pidfile_record` returned (or a bare
+    ``int`` for callers that only have that). Returns::
+
+        {
+          "pid": int | None,
+          "running": bool,                 # a process with this PID exists now
+          "identity_verified": bool | None,  # None when unverifiable
+          "confidence": "absent" | "stale" | "unverified" | "degraded" | "verified",
+          "reason": str,
+        }
+
+    * ``absent``     — no PID recorded at all.
+    * ``stale``       — a PID was recorded, but either no live process has
+      that PID, or one does and its executable/start time contradict what
+      was recorded — almost certainly a reused PID, not our process.
+    * ``unverified``  — a legacy plain-integer file: a live process has that
+      PID, but there is no recorded identity to compare it against.
+    * ``degraded``    — a live process has that PID and some identity was
+      recorded, but this platform/permission level could not confirm a
+      match on either field — never confidently "running".
+    * ``verified``    — a live process has that PID AND its recorded process
+      start time matches; executable identity, when available, matches too.
+    """
+    if isinstance(record, int):
+        record = {"format": "legacy", "pid": record, "exe": None, "start_time": None}
+    if record is None:
+        return {
+            "pid": None,
+            "running": False,
+            "identity_verified": None,
+            "confidence": CONFIDENCE_ABSENT,
+            "reason": "no pidfile recorded",
+        }
+    pid = record.get("pid")
+    if type(pid) is not int or pid <= 0:
+        return {
+            "pid": pid,
+            "running": False,
+            "identity_verified": None,
+            "confidence": CONFIDENCE_ABSENT,
+            "reason": "pidfile has no valid pid",
+        }
+    live = _read_process_identity(pid)
+    if live is None:
+        return {
+            "pid": pid,
+            "running": False,
+            "identity_verified": None,
+            "confidence": CONFIDENCE_STALE,
+            "reason": f"no process with pid {pid} is currently running",
+        }
+    if record.get("format") == "legacy":
+        return {
+            "pid": pid,
+            "running": True,
+            "identity_verified": None,
+            "confidence": CONFIDENCE_UNVERIFIED,
+            "reason": "legacy pidfile recorded no identity to verify against",
+        }
+    exe_recorded = record.get("exe")
+    start_recorded = record.get("start_time")
+    exe_live = live.get("exe")
+    start_live = live.get("start_time")
+    cmdline_recorded = str(record.get("cmdline") or "").lower()
+    cmdline_live = str(live.get("cmdline") or "").lower()
+    service_cmdline_match = (
+        "brains" in cmdline_recorded
+        and "serve-all" in cmdline_recorded
+        and "brains" in cmdline_live
+        and "serve-all" in cmdline_live
+    )
+    exe_checked = all(
+        isinstance(value, str) and bool(_normalize_exe(value)) for value in (exe_recorded, exe_live)
+    )
+    start_checked = all(
+        isinstance(value, int | float)
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value > 0
+        for value in (start_recorded, start_live)
+    )
+    if not exe_checked and not start_checked:
+        return {
+            "pid": pid,
+            "running": True,
+            "identity_verified": None,
+            "confidence": CONFIDENCE_DEGRADED,
+            "reason": "process exists but its identity could not be confirmed on this platform",
+        }
+    exe_match = (_normalize_exe(exe_recorded) == _normalize_exe(exe_live)) if exe_checked else True
+    start_match = True
+    if start_checked:
+        assert isinstance(start_recorded, int | float)
+        assert isinstance(start_live, int | float)
+        start_match = (
+            abs(float(start_recorded) - float(start_live)) <= _START_TIME_TOLERANCE_SECONDS
+        )
+    if start_checked and exe_match and start_match:
+        return {
+            "pid": pid,
+            "running": True,
+            "identity_verified": True,
+            "confidence": CONFIDENCE_VERIFIED,
+            "reason": "pid and start time match the recorded service; executable matches "
+            "when available",
+        }
+    if exe_match and service_cmdline_match:
+        return {
+            "pid": pid,
+            "running": True,
+            "identity_verified": True,
+            "confidence": CONFIDENCE_VERIFIED,
+            "reason": "pid, executable and Brains serve-all command line match; "
+            "platform start time was unavailable or inconsistent",
+        }
+    if not start_checked and exe_match:
+        return {
+            "pid": pid,
+            "running": True,
+            "identity_verified": None,
+            "confidence": CONFIDENCE_DEGRADED,
+            "reason": "executable matches but process start time could not be verified",
+        }
+    return {
+        "pid": pid,
+        "running": True,
+        "identity_verified": False,
+        "confidence": CONFIDENCE_STALE,
+        # Both fields must independently contradict a complete recorded identity.
+        # A comm-only change can be exec/normalization, not the old process exiting;
+        # a timestamp-only change can be clock/rounding drift. Neither proves reuse.
+        "identity_mismatch": bool(
+            exe_checked and start_checked and not exe_match and not start_match
+        ),
+        "reason": "pid is running but its executable/start-time no longer match the recorded "
+        "service — this pid was almost certainly reused by an unrelated process",
+    }
+
+
+def cleanup_stale_pidfile(
+    path: Path | None = None,
+    *,
+    expected_content: bytes | None = None,
+    allow_identity_mismatch: bool = True,
+) -> dict[str, Any]:
+    """Remove ``path`` when it records a stale PID; leave a
+    verified/unverifiable-but-running one alone. Returns the driving
+    :func:`verify_pid` result plus a ``removed`` bool.
+
+    A complete executable AND start-time contradiction permits removal of the
+    stale record, never a signal to the process now using its PID. Read back the
+    bytes after probing, and optionally bind them to a caller's captured snapshot.
+    This is a cooperative readback guard, not an atomic compare-and-unlink.
+    """
+    target = path or default_pidfile_path()
+    try:
+        content = target.read_bytes()
+    except OSError:
+        content = None
+    if expected_content is not None and content is not None and content != expected_content:
+        return {**verify_pid(None), "removed": False}
+    record = read_pidfile_record(target)
+    if content is not None:
+        try:
+            if target.read_bytes() != content:
+                record = None
+        except OSError:
+            record = None
+    result = verify_pid(record)
+    result["removed"] = False
+    if (
+        record is not None
+        and content is not None
+        and result["confidence"] == CONFIDENCE_STALE
+        and (
+            not result["running"]
+            or (allow_identity_mismatch and result.get("identity_mismatch") is True)
+        )
+    ):
+        try:
+            if target.is_symlink() or target.read_bytes() != content:
+                return result
+            target.unlink()
+            result["removed"] = True
+        except OSError:
+            pass
+    return result
+
+
+class UnsupportedPlatform(RuntimeError):
+    """Raised when no service backend exists for the current OS."""
